@@ -1,0 +1,52 @@
+{
+  "name": "obsidian-second-brain-mcp",
+  "version": "1.0.0",
+  "description": "A local MCP server for safely automating Obsidian through the official Obsidian CLI.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/theon199/obsidian-second-brain-mcp.git"
+  },
+  "homepage": "https://github.com/theon199/obsidian-second-brain-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/theon199/obsidian-second-brain-mcp/issues"
+  },
+  "keywords": [
+    "obsidian",
+    "mcp",
+    "model-context-protocol",
+    "codex",
+    "antigravity",
+    "second-brain"
+  ],
+  "type": "module",
+  "private": true,
+  "bin": {
+    "obsidian-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:smoke": "OBSIDIAN_MCP_RUN_SMOKE=1 vitest run tests/smoke.real.test.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
+    "@types/node": "26.2.0",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}
