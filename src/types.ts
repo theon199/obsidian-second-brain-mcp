@@ -40,3 +40,9 @@ export interface AuditEntry {
   after?: Record<string, unknown> | null | undefined;
   error?: string | undefined;
 }
+
+export interface ServerDependencies {
+  executor: ObsidianExecutor;
+  audit: { write(entry: AuditEntry): Promise<void> };
+  defaultVault?: string | undefined;
+}

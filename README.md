@@ -6,6 +6,12 @@ STDIO, so no HTTP listener, API key, embeddings index, or cloud service is
 required. Obsidian remains the system of record; the server does not edit an
 iCloud vault directly.
 
+Version **1.1** adds a **PARA + life-todo** layer: typed capture/file/task
+tools, MCP prompts, and read-only resources. The host LLM plans natural-language
+workflows; the server stays a thin, audited CLI facade. See
+[docs/PARA.md](docs/PARA.md), [docs/PROMPTS.md](docs/PROMPTS.md), and
+[docs/ROADMAP.md](docs/ROADMAP.md).
+
 ## Requirements
 
 - macOS with Obsidian 1.12.7 or newer.
@@ -25,6 +31,10 @@ The server selects the most recently opened vault ID from
 `~/Library/Application Support/obsidian/obsidian.json`. This means the vault
 can stay in iCloud while commands still go through Obsidian. Set
 `OBSIDIAN_VAULT_ID` to target a different registered vault.
+
+For PARA workflows, run `ensure_para` once after install (or ask the client to)
+so `Inbox/`, `Projects/`, `Areas/`, `Resources/`, `Archives/`, and
+`Life/Todos.md` exist.
 
 ## Install and configure
 
@@ -71,7 +81,7 @@ full client restart may still be needed after the first install.
 
 ## Tools
 
-The server exposes ten tools. Read-only tools return structured data and do not
+The server exposes fourteen tools. Read-only tools return structured data and do not
 write the audit log; mutations return concise before/after evidence and append
 one JSONL audit record.
 
@@ -84,36 +94,58 @@ one JSONL audit record.
 | `update_note` | Appends or prepends content, sets/removes properties, and changes a task's status. |
 | `organize_note` | Moves, renames, or sends a note to Obsidian trash. It never permanently deletes. |
 | `daily_note` | Reads, opens, appends to, or prepends to the active daily note. |
-| `manage_tasks` | Lists tasks or completes/reopens/assigns a custom one-character task status. |
-| `suggest_use_cases` | Uses native graph and organization signals to rank three contextual second-brain workflows. |
+| `ensure_para` | Idempotently seeds PARA roots, Inbox, and `Life/Todos.md` when missing. |
+| `list_para` | Lists notes under one or all PARA roots with counts and path samples. |
+| `capture` | Creates or appends an Inbox capture (optional checkbox task and properties). |
+| `file_note` | Moves a note into Inbox / Projects / Areas / Resources / Archives by PARA category. |
+| `manage_tasks` | Lists, adds, or updates tasks; `scope` `life` \| `daily` \| `all`, optional folder filter. |
+| `suggest_use_cases` | Ranks contextual second-brain workflows from graph, PARA, and task signals. |
 | `run_obsidian_command` | Runs an argument array for other Obsidian/plugin commands after safety checks. |
 
-The server instructions encourage an MCP client to search before assuming a
-note exists, inspect links/backlinks before proposing connections, use typed
-tools for ordinary work, and call `suggest_use_cases` when the user wants
-creative ideas grounded in their actual vault.
+## Prompts and resources
+
+| Prompt | Purpose |
+| --- | --- |
+| `para_inbox_triage` | Coach Inbox → PARA filing via `list_para` / `file_note`. |
+| `weekly_life_review` | Areas + life todos → summary appended to the daily note. |
+| `capture_life_todo` | Turn free text into a `Life/Todos.md` checkbox (`text` arg). |
+| `project_status` | Inspect `Projects/{project}` notes and tasks (`project` arg). |
+
+| Resource URI | Purpose |
+| --- | --- |
+| `obsidian-sb://para/overview` | PARA folder counts and samples. |
+| `obsidian-sb://inbox` | Inbox file list. |
+| `obsidian-sb://life/todos` | Contents of `Life/Todos.md`. |
+| `obsidian-sb://templates` | Vault templates from the CLI. |
+
+The server instructions encourage: `capture` → review → `file_note` →
+`manage_tasks`; search before assuming a note exists; prefer typed tools; use
+prompts for PARA/life coaching; call `suggest_use_cases` for creative ideas
+grounded in vault evidence.
 
 ## Creative workflows
 
 The recommendation tool can surface workflows such as:
 
+- **PARA inbox triage:** file Inbox notes into Projects, Areas, Resources, or Archives.
+- **Weekly life review:** combine Areas, life todos, and open tasks into a daily-note narrative.
+- **Project next-actions sweep:** clarify the next move on active projects.
 - **Forgotten-note resurfacing:** rotate orphan notes into a daily review and
   connect the useful ones to active projects.
 - **Bridge-note generator:** find disconnected tag/link clusters and outline a
   synthesis note that gives them a shared concept.
 - **Knowledge-gap radar:** turn unresolved links and dead ends into a ranked
   research queue.
-- **Weekly synthesis cockpit:** combine recent notes and unfinished tasks into
-  wins, open loops, decisions, and next actions.
 - **Idea-collision studio:** combine unrelated tag clusters into writing,
   experiment, or project concepts grounded in real notes.
 
 Example prompts:
 
 ```text
-Find three overlooked connections in my vault and explain why they matter.
-Turn today's loose notes into a connected synthesis note.
-Show unfinished tasks and append the best next actions to today's daily note.
+Capture "renew passport" as a life todo.
+Triage my Inbox with PARA and file what is clearly a project.
+Show unfinished life tasks and append next actions to today's daily note.
+Status on project Website Redesign.
 Suggest three creative second-brain workflows based on how my vault is structured.
 ```
 
@@ -144,7 +176,7 @@ the installer to refresh those absolute values.
   interpolation.
 - Permanent deletion, arbitrary `eval`, and raw `dev:*`/developer-control
   commands are blocked, including through `run_obsidian_command`.
-- `organize_note` uses Obsidian's delete/trash command only.
+- `organize_note` and `file_note` use Obsidian move/trash only (no permanent delete).
 - Every mutation records timestamp, tool, vault, affected targets, sanitized
   arguments, status, duration, and before/after metadata or content hashes.
 - Content/body/text arguments are represented only by length and SHA-256 in the

@@ -1,6 +1,17 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
-import type { AuditSink } from "./audit.js";
+import {
+  LIFE_TODOS_PATH,
+  PARA_ROOTS,
+  assertSafeVaultPath,
+  buildParaDestination,
+  ensureMdExtension,
+  inboxCapturePath,
+  paraPropertyDefaults,
+  seedNotes,
+  slugify,
+  type ParaCategory,
+} from "./para.js";
 import { nonEmptyLines, parseCount, parseJsonOrText } from "./parse.js";
 import { runChecked } from "./runner.js";
 import {
@@ -11,7 +22,16 @@ import {
   isVaultRelativePath,
   validateGenericArgs,
 } from "./safety.js";
-import type { AuditEntry, CommandResult, ObsidianExecutor, ToolEnvelope } from "./types.js";
+import { collectParaOverview, registerSecondBrainSurface } from "./second-brain.js";
+import type {
+  AuditEntry,
+  CommandResult,
+  ObsidianExecutor,
+  ServerDependencies,
+  ToolEnvelope,
+} from "./types.js";
+
+export type { ServerDependencies } from "./types.js";
 
 const envelopeSchema = z.object({
   ok: z.boolean(),
@@ -33,12 +53,6 @@ const targetSchema = z
   .refine((value) => !(value.path && value.file), "Provide path or file, not both.");
 
 type Target = z.infer<typeof targetSchema>;
-
-export interface ServerDependencies {
-  executor: ObsidianExecutor;
-  audit: AuditSink;
-  defaultVault?: string;
-}
 
 function targetArgs(target: Target): string[] {
   return target.path ? [`path=${target.path}`] : [`file=${target.file}`];
@@ -178,12 +192,14 @@ async function setProperties(
 
 export function buildServer(deps: ServerDependencies): McpServer {
   const server = new McpServer(
-    { name: "local-obsidian", version: "1.0.0" },
+    { name: "local-obsidian", version: "1.1.0" },
     {
       instructions:
-        "Use this server to inspect and automate the user's local Obsidian vault. Search before assuming a note exists; use read_note with links/backlinks before proposing connections. Prefer typed tools for normal work. Deletes always go to trash. run_obsidian_command blocks permanent deletion, eval, and dev controls. For creative coaching, call suggest_use_cases and ground recommendations in its vault evidence. Changes are autonomous and audited without copying note content into logs.",
+        "Use this server as a PARA second brain over the user's local Obsidian vault. Prefer capture → read/review → file_note → manage_tasks for life and project work. Call ensure_para once if Inbox/Projects/Areas/Resources/Archives or Life/Todos.md are missing. Search before assuming a note exists; use read_note with links/backlinks before proposing connections. Prefer typed tools for normal work. Deletes always go to trash. run_obsidian_command blocks permanent deletion, eval, and dev controls. For coaching, use MCP prompts (para_inbox_triage, weekly_life_review, capture_life_todo, project_status) or suggest_use_cases grounded in vault evidence. Changes are autonomous and audited without copying note content into logs.",
     },
   );
+
+  registerSecondBrainSurface(server, deps);
 
   server.registerTool(
     "vault_overview",
@@ -558,17 +574,269 @@ export function buildServer(deps: ServerDependencies): McpServer {
     },
   );
 
-  const tasksSchema = z.object({
-    action: z.enum(["list", "update"]),
-    path: vaultPathSchema.optional(),
-    file: vaultPathSchema.optional(),
-    ref: z.string().min(1).optional(),
-    line: z.number().int().positive().optional(),
-    filter: z.enum(["todo", "done", "all"]).default("todo"),
-    status: z.string().length(1).optional(),
-    done: z.boolean().optional(),
-    daily: z.boolean().default(false),
-  })
+  const paraCategorySchema = z.enum(["inbox", "project", "area", "resource", "archive"]);
+
+  async function noteExists(path: string): Promise<boolean> {
+    const result = await deps.executor.run(["file", `path=${path}`], { vault: deps.defaultVault });
+    return result.exitCode === 0;
+  }
+
+  server.registerTool(
+    "ensure_para",
+    {
+      title: "Ensure PARA Structure",
+      description:
+        "Idempotently create Inbox, Projects, Areas, Resources, Archives seed notes and Life/Todos.md if missing.",
+      inputSchema: z.object({}),
+      outputSchema: envelopeSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    async (input) => {
+      try {
+        const envelope = await auditMutation({
+          tool: "ensure_para",
+          input,
+          deps,
+          action: async () => {
+            const created: string[] = [];
+            const existing: string[] = [];
+            const results: CommandResult[] = [];
+            for (const seed of seedNotes()) {
+              if (await noteExists(seed.path)) {
+                existing.push(seed.path);
+                continue;
+              }
+              results.push(
+                await runChecked(
+                  deps.executor,
+                  ["create", `path=${seed.path}`, `content=${seed.content}`],
+                  { vault: deps.defaultVault },
+                ),
+              );
+              created.push(seed.path);
+            }
+            return {
+              data: {
+                created,
+                existing,
+                roots: [...PARA_ROOTS],
+                lifeTodosPath: LIFE_TODOS_PATH,
+              },
+              results,
+            };
+          },
+        });
+        return output(envelope);
+      } catch (error) {
+        return errorOutput(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "list_para",
+    {
+      title: "List PARA Structure",
+      description: "List notes under one or all PARA roots with counts and path samples.",
+      inputSchema: z.object({
+        category: z.enum(["all", "inbox", "project", "area", "resource", "archive"]).default("all"),
+        sampleLimit: z.number().int().min(1).max(200).default(40),
+      }),
+      outputSchema: envelopeSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ category, sampleLimit }) => {
+      try {
+        const data = await collectParaOverview(
+          deps,
+          sampleLimit,
+          category === "all" ? "all" : (category as ParaCategory),
+        );
+        return output({ ok: true, data });
+      } catch (error) {
+        return errorOutput(error);
+      }
+    },
+  );
+
+  const captureSchema = z
+    .object({
+      title: z.string().min(1).describe("Title used for the Inbox note name when path is omitted"),
+      content: z.string().optional(),
+      path: vaultPathSchema.optional().describe("Optional override path (defaults under Inbox/)"),
+      asTask: z.boolean().default(false).describe("When true, body starts with an incomplete checkbox task"),
+      properties: z.record(z.string(), propertyValue).default({}),
+      append: z.boolean().default(false).describe("Append to an existing note at path instead of creating"),
+    })
+    .refine((value) => !(value.append && !value.path), {
+      message: "append requires an explicit path.",
+    });
+
+  server.registerTool(
+    "capture",
+    {
+      title: "Capture to Inbox",
+      description:
+        "Create or append a capture note (default Inbox/), optionally as a checkbox task, with optional properties.",
+      inputSchema: captureSchema,
+      outputSchema: envelopeSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+    },
+    async (input) => {
+      const path = input.path ? ensureMdExtension(input.path) : inboxCapturePath(input.title);
+      assertSafeVaultPath(path);
+      const target: Target = { path };
+      const bodyCore = input.content?.trim() ? input.content : input.title;
+      const body = input.asTask
+        ? `- [ ] ${bodyCore.replace(/^\s*-\s*\[[ xX]\]\s*/, "")}\n`
+        : `${bodyCore}\n`;
+      const properties = {
+        ...paraPropertyDefaults("inbox"),
+        ...input.properties,
+      };
+      try {
+        const envelope = await auditMutation({
+          tool: "capture",
+          input,
+          deps,
+          afterTarget: target,
+          ...(input.append ? { beforeTarget: target } : {}),
+          action: async () => {
+            const results: CommandResult[] = [];
+            if (input.append) {
+              results.push(
+                await runChecked(deps.executor, ["append", `path=${path}`, `content=${body}`], {
+                  vault: deps.defaultVault,
+                }),
+              );
+            } else {
+              const content = `# ${input.title}\n\n${body}`;
+              results.push(
+                await runChecked(
+                  deps.executor,
+                  ["create", `path=${path}`, `content=${content}`],
+                  { vault: deps.defaultVault },
+                ),
+              );
+            }
+            results.push(...(await setProperties(deps.executor, target, properties, deps.defaultVault)));
+            return {
+              data: { path, title: input.title, asTask: input.asTask, appended: input.append },
+              results,
+            };
+          },
+        });
+        return output(envelope);
+      } catch (error) {
+        return errorOutput(error);
+      }
+    },
+  );
+
+  const fileNoteSchema = targetSchema.and(
+    z.object({
+      category: paraCategorySchema,
+      name: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Project/area/resource/archive bucket name; required for project and area"),
+      setProperties: z.boolean().default(true),
+    }),
+  );
+
+  server.registerTool(
+    "file_note",
+    {
+      title: "File Note into PARA",
+      description:
+        "Move a note into Inbox, Projects/{name}, Areas/{name}, Resources, or Archives using PARA conventions.",
+      inputSchema: fileNoteSchema,
+      outputSchema: envelopeSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+    },
+    async (input) => {
+      const beforeTarget: Target = input.path ? { path: input.path } : { file: input.file! };
+      try {
+        let sourcePath = input.path;
+        if (!sourcePath) {
+          const info = await runChecked(deps.executor, ["file", ...targetArgs(beforeTarget)], {
+            vault: deps.defaultVault,
+          });
+          const parsed = parseJsonOrText(info.stdout);
+          if (parsed && typeof parsed === "object" && "path" in parsed && typeof parsed.path === "string") {
+            sourcePath = parsed.path;
+          } else {
+            const lines = nonEmptyLines(info.stdout);
+            sourcePath = lines[0] ?? input.file!;
+          }
+        }
+        const destination = buildParaDestination({
+          category: input.category,
+          name: input.name,
+          sourcePath,
+        });
+        const afterTarget: Target = { path: destination };
+        const envelope = await auditMutation({
+          tool: "file_note",
+          input,
+          deps,
+          beforeTarget,
+          afterTarget,
+          action: async () => {
+            const results: CommandResult[] = [
+              await runChecked(
+                deps.executor,
+                ["move", ...targetArgs(beforeTarget), `to=${destination}`],
+                { vault: deps.defaultVault },
+              ),
+            ];
+            if (input.setProperties) {
+              results.push(
+                ...(await setProperties(
+                  deps.executor,
+                  afterTarget,
+                  paraPropertyDefaults(input.category, input.name),
+                  deps.defaultVault,
+                )),
+              );
+            }
+            return {
+              data: {
+                from: targetLabel(beforeTarget),
+                to: destination,
+                category: input.category,
+                ...(input.name ? { name: slugify(input.name) } : {}),
+              },
+              results,
+            };
+          },
+        });
+        return output(envelope);
+      } catch (error) {
+        return errorOutput(error);
+      }
+    },
+  );
+
+  const tasksSchema = z
+    .object({
+      action: z.enum(["list", "update", "add"]),
+      path: vaultPathSchema.optional(),
+      file: vaultPathSchema.optional(),
+      folder: vaultPathSchema.optional().describe("Folder scope for list (maps to path= on tasks CLI)"),
+      ref: z.string().min(1).optional(),
+      line: z.number().int().positive().optional(),
+      filter: z.enum(["todo", "done", "all"]).default("todo"),
+      status: z.string().length(1).optional(),
+      done: z.boolean().optional(),
+      daily: z.boolean().default(false),
+      scope: z
+        .enum(["life", "daily", "all"])
+        .default("all")
+        .describe("Convenience scope: life → Life/Todos.md, daily → daily note tasks"),
+      text: z.string().min(1).optional().describe("Task text when action is add"),
+    })
     .refine((value) => !(value.path && value.file), {
       message: "Provide path or file, not both.",
     })
@@ -582,34 +850,99 @@ export function buildServer(deps: ServerDependencies): McpServer {
     .refine(
       (value) => value.action !== "update" || !(value.status !== undefined && value.done !== undefined),
       { message: "Provide task status or done, not both." },
-    );
+    )
+    .refine((value) => value.action !== "add" || Boolean(value.text), {
+      message: "Adding a task requires text.",
+    });
 
   server.registerTool(
     "manage_tasks",
     {
       title: "Manage Tasks",
-      description: "List tasks or change a task's completion/custom status.",
+      description:
+        "List, add, or update tasks. Use scope life for Life/Todos.md, daily for the daily note, or folder/path for a project.",
       inputSchema: tasksSchema,
       outputSchema: envelopeSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
     async (input) => {
       try {
+        const useDaily = input.daily || input.scope === "daily";
+        const lifePath = input.scope === "life" ? LIFE_TODOS_PATH : undefined;
         const optionalTarget: Target | undefined = input.path
           ? { path: input.path }
           : input.file
             ? { file: input.file }
-            : undefined;
+            : lifePath
+              ? { path: lifePath }
+              : input.folder
+                ? { path: input.folder }
+                : undefined;
+
         if (input.action === "list") {
           const args = ["tasks"];
           if (optionalTarget) args.push(...targetArgs(optionalTarget));
-          if (input.daily) args.push("daily");
+          if (useDaily) args.push("daily");
           if (input.status) args.push(`status=${input.status}`);
           if (input.filter !== "all") args.push(input.filter);
           args.push("verbose", "format=json");
           const result = await runChecked(deps.executor, args, { vault: deps.defaultVault });
-          return output({ ok: true, data: parseJsonOrText(result.stdout) });
+          return output({
+            ok: true,
+            data: {
+              scope: input.scope,
+              tasks: parseJsonOrText(result.stdout),
+            },
+          });
         }
+
+        if (input.action === "add") {
+          const taskLine = `- [ ] ${input.text!.replace(/^\s*-\s*\[[ xX]\]\s*/, "")}\n`;
+          const envelope = await auditMutation({
+            tool: "manage_tasks",
+            input,
+            deps,
+            ...(optionalTarget && !useDaily ? { beforeTarget: optionalTarget, afterTarget: optionalTarget } : {}),
+            action: async () => {
+              if (useDaily) {
+                const result = await runChecked(
+                  deps.executor,
+                  ["daily:append", `content=${taskLine}`],
+                  { vault: deps.defaultVault },
+                );
+                return {
+                  data: { action: "add" as const, scope: "daily" as const, target: "daily", text: input.text },
+                  results: [result],
+                };
+              }
+              const target = optionalTarget ?? { path: LIFE_TODOS_PATH };
+              if (target.path === LIFE_TODOS_PATH && !(await noteExists(LIFE_TODOS_PATH))) {
+                const seed = seedNotes().find((note) => note.path === LIFE_TODOS_PATH)!;
+                await runChecked(
+                  deps.executor,
+                  ["create", `path=${seed.path}`, `content=${seed.content}`],
+                  { vault: deps.defaultVault },
+                );
+              }
+              const result = await runChecked(
+                deps.executor,
+                ["append", ...targetArgs(target), `content=${taskLine}`],
+                { vault: deps.defaultVault },
+              );
+              return {
+                data: {
+                  action: "add" as const,
+                  scope: input.scope,
+                  target: targetLabel(target),
+                  text: input.text,
+                },
+                results: [result],
+              };
+            },
+          });
+          return output(envelope);
+        }
+
         const envelope = await auditMutation({
           tool: "manage_tasks",
           input,
@@ -620,7 +953,7 @@ export function buildServer(deps: ServerDependencies): McpServer {
             if (optionalTarget) args.push(...targetArgs(optionalTarget));
             if (input.ref) args.push(`ref=${input.ref}`);
             if (input.line) args.push(`line=${input.line}`);
-            if (input.daily) args.push("daily");
+            if (useDaily) args.push("daily");
             if (input.status) args.push(`status=${input.status}`);
             else if (input.done !== undefined) args.push(input.done ? "done" : "todo");
             const result = await runChecked(deps.executor, args, { vault: deps.defaultVault });
@@ -638,7 +971,8 @@ export function buildServer(deps: ServerDependencies): McpServer {
     "suggest_use_cases",
     {
       title: "Suggest Creative Vault Workflows",
-      description: "Analyze native graph and organization signals, then rank contextual second-brain workflows.",
+      description:
+        "Analyze native graph, PARA, and task signals, then rank contextual second-brain workflows.",
       inputSchema: z.object({ sampleLimit: z.number().int().min(3).max(100).default(20) }),
       outputSchema: envelopeSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
@@ -656,6 +990,25 @@ export function buildServer(deps: ServerDependencies): McpServer {
         const results = await Promise.all(
           commands.map((args) => runChecked(deps.executor, args, { vault: deps.defaultVault })),
         );
+        const para = await collectParaOverview(deps, sampleLimit);
+        const inboxCount =
+          typeof para.entries === "object" &&
+          para.entries &&
+          "Inbox" in (para.entries as Record<string, { count?: number }>)
+            ? ((para.entries as Record<string, { count?: number }>).Inbox?.count ?? 0)
+            : 0;
+        const projectsCount =
+          typeof para.entries === "object" &&
+          para.entries &&
+          "Projects" in (para.entries as Record<string, { count?: number }>)
+            ? ((para.entries as Record<string, { count?: number }>).Projects?.count ?? 0)
+            : 0;
+        const areasCount =
+          typeof para.entries === "object" &&
+          para.entries &&
+          "Areas" in (para.entries as Record<string, { count?: number }>)
+            ? ((para.entries as Record<string, { count?: number }>).Areas?.count ?? 0)
+            : 0;
         const signals = {
           orphans: sampleLines(results[0]!.stdout, sampleLimit),
           deadends: sampleLines(results[1]!.stdout, sampleLimit),
@@ -663,8 +1016,29 @@ export function buildServer(deps: ServerDependencies): McpServer {
           tags: sampleLines(results[3]!.stdout, sampleLimit),
           incompleteTasks: sampleLines(results[4]!.stdout, sampleLimit),
           recentNotes: sampleLines(results[5]!.stdout, sampleLimit),
+          inboxNotes: { count: inboxCount },
+          projectNotes: { count: projectsCount },
+          areaNotes: { count: areasCount },
         };
         const candidates = [
+          {
+            title: "PARA inbox triage",
+            score: inboxCount * 5 + signals.incompleteTasks.count,
+            why: `${inboxCount} Inbox items are waiting to be filed into Projects, Areas, Resources, or Archives.`,
+            nextPrompt: "Use prompt para_inbox_triage and file confirmed notes with file_note.",
+          },
+          {
+            title: "Weekly life review",
+            score: areasCount * 2 + signals.incompleteTasks.count * 2 + signals.recentNotes.count,
+            why: "Areas coverage plus unfinished tasks can become a weekly life narrative and next-action list.",
+            nextPrompt: "Use prompt weekly_life_review and append the summary to today's daily note.",
+          },
+          {
+            title: "Project next-actions sweep",
+            score: projectsCount * 3 + signals.incompleteTasks.count,
+            why: `${projectsCount} project notes with open tasks need a crisp next-action pass.`,
+            nextPrompt: "Pick an active project and run prompt project_status with its folder name.",
+          },
           {
             title: "Forgotten-note resurfacing ritual",
             score: signals.orphans.count * 3 + signals.deadends.count,
@@ -684,12 +1058,6 @@ export function buildServer(deps: ServerDependencies): McpServer {
             nextPrompt: "Rank unresolved links by likely value and create a research queue in today's daily note.",
           },
           {
-            title: "Weekly synthesis cockpit",
-            score: signals.incompleteTasks.count * 2 + signals.recentNotes.count,
-            why: "Recent notes and unfinished tasks can become a concise weekly narrative, decisions list, and next-action plan.",
-            nextPrompt: "Synthesize recent notes and unfinished tasks into wins, open loops, and next moves.",
-          },
-          {
             title: "Idea-collision studio",
             score: signals.tags.count * 2 + signals.recentNotes.count,
             why: "Combine notes from different high-signal tags to generate original writing, experiments, or project concepts.",
@@ -703,6 +1071,7 @@ export function buildServer(deps: ServerDependencies): McpServer {
           data: {
             recommendations: candidates,
             evidence: signals,
+            para,
             guidance:
               "Treat scores as routing hints, not quality judgments. Read the cited notes before making changes.",
           },
